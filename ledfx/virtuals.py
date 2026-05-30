@@ -902,9 +902,14 @@ class Virtual:
                     # )
                     self.assembled_frame = self.assemble_frame()
                     if self.assembled_frame is not None and not self._paused:
-                        # Apply color override if active (overpaint-before-flush)
+                        # Apply color override as a gel/tint: keep the effect's
+                        # per-pixel luminance but replace the color with the override.
                         if self._color_override_frame is not None:
-                            self.assembled_frame = self._color_override_frame
+                            luminance = (
+                                np.max(self.assembled_frame, axis=1, keepdims=True)
+                                / 255.0
+                            )
+                            self.assembled_frame = self._color_override_frame * luminance
                         if not self._config["preview_only"]:
                             # self._ledfx.thread_executor.submit(self.flush)
                             # await self._ledfx.loop.run_in_executor(

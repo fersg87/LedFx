@@ -209,6 +209,11 @@ class Virtual:
         # Maps virtual indices to device indices per device
         self._device_remap: dict = {}
 
+        # Color override: when set, overpaints assembled_frame before flush.
+        # Effects keep running in the background; override is instant on/off.
+        self._color_override: Optional[str] = None
+        self._color_override_frame: Optional[np.ndarray] = None
+
         self._debug_flush_total = 0.0
         self._debug_last_report = time.perf_counter()
         self._debug_flush_frames = 0
@@ -383,6 +388,9 @@ class Virtual:
                 if self.pixel_count != _pixel_count:
                     # chenging segments is a deep edit, just flush any transition
                     self._reactivate_effect()
+                    # Rebuild override frame if pixel count changed
+                    if self._color_override is not None:
+                        self._color_override_frame = self._build_override_frame()
 
                 mode = self._config["transition_mode"]
                 self.frame_transitions = self.transitions[mode]
@@ -779,6 +787,56 @@ class Virtual:
         self.flush(self.assembled_frame)
         self._fire_update_event()
 
+    def _build_override_frame(self) -> Optional[np.ndarray]:
+        """Compute the override numpy frame from the stored color/gradient string."""
+        if self._color_override is None or self.pixel_count == 0:
+            return None
+
+        from ledfx.color import RGB, Gradient, parse_gradient
+
+        try:
+            parsed = parse_gradient(self._color_override)
+        except Exception:
+            _LOGGER.warning(
+                "Virtual %s: invalid color override '%s', using white",
+                self.id,
+                self._color_override,
+            )
+            parsed = RGB(255, 255, 255)
+
+        n = self.pixel_count
+
+        if isinstance(parsed, RGB):
+            return np.tile([parsed.red, parsed.green, parsed.blue], (n, 1)).astype(float)
+
+        # Gradient: sample n evenly-spaced positions using Gradient.sample()
+        frame = np.empty((n, 3), dtype=float)
+        for i in range(n):
+            pos = i / max(n - 1, 1)
+            hex_c = parsed.sample(pos)
+            r = int(hex_c[1:3], 16)
+            g = int(hex_c[3:5], 16)
+            b = int(hex_c[5:7], 16)
+            frame[i] = [r, g, b]
+        return frame
+
+    def set_color_override(self, color_or_gradient: str):
+        """Activate a persistent color/gradient overpaint on this virtual.
+
+        The running effect continues computing frames in the background.
+        Each render cycle the assembled frame is replaced with this color
+        before being sent to devices, so toggling off is instantaneous.
+        """
+        with self.lock:
+            self._color_override = color_or_gradient
+            self._color_override_frame = self._build_override_frame()
+
+    def clear_color_override(self):
+        """Remove the color override; the running effect is immediately visible again."""
+        with self.lock:
+            self._color_override = None
+            self._color_override_frame = None
+
     def _fire_update_event(self, frame=None):
         if frame is None:
             frame = self.assembled_frame
@@ -844,6 +902,9 @@ class Virtual:
                     # )
                     self.assembled_frame = self.assemble_frame()
                     if self.assembled_frame is not None and not self._paused:
+                        # Apply color override if active (overpaint-before-flush)
+                        if self._color_override_frame is not None:
+                            self.assembled_frame = self._color_override_frame
                         if not self._config["preview_only"]:
                             # self._ledfx.thread_executor.submit(self.flush)
                             # await self._ledfx.loop.run_in_executor(

@@ -430,7 +430,7 @@ def _apply_gradient_override(
                     self._reactivate_effect()
                     # Rebuild override frame if pixel count changed
                     if self._color_override is not None:
-                        self._color_override_frame, self._color_override_lut = self._build_override_frame()
+                        self._apply_color_override_to_effect()
 
                 mode = self._config["transition_mode"]
                 self.frame_transitions = self.transitions[mode]
@@ -700,6 +700,9 @@ def _apply_gradient_override(
                 )
                 return
             self._active_effect.activate(self)
+            # Re-apply any active colour override to the new effect
+            if self._color_override is not None:
+                self._apply_color_override_to_effect()
             self._ledfx.events.fire_event(
                 EffectSetEvent(
                     self._active_effect.name,
@@ -880,25 +883,55 @@ def _apply_gradient_override(
 
         return spatial, lut
 
-    def set_color_override(self, color_or_gradient: str):
-        """Activate a persistent color/gradient overpaint on this virtual.
+    def _apply_color_override_to_effect(self):
+        """Internal: route override to the effect or to post-processing.
 
-        The running effect continues computing frames in the background.
-        Each render cycle the assembled frame is tinted by this color:
-        - Solid color: preserves per-pixel brightness, replaces hue/sat.
-        - Gradient: maps the effect's per-pixel hue to the gradient LUT,
-          preserving the effect's motion/animation in the new color palette.
+        Called (inside self.lock) whenever the override is activated or the
+        pixel count changes while an override is active.
+        """
+        from ledfx.effects.gradient import GradientEffect
+
+        if self._color_override is None:
+            return
+
+        if isinstance(self._active_effect, GradientEffect):
+            # The effect handles colour natively — inject the override gradient
+            # so animations (roll, modulation, etc.) continue unaffected.
+            self._active_effect.set_gradient_override(self._color_override)
+            # No post-processing needed
+            self._color_override_frame = None
+            self._color_override_lut = None
+        else:
+            # Fallback: post-process the assembled frame for effects that don't
+            # expose a gradient config (e.g. Energy, custom solid-colour effects).
+            self._color_override_frame, self._color_override_lut = (
+                self._build_override_frame()
+            )
+
+    def set_color_override(self, color_or_gradient: str):
+        """Activate a persistent colour override on this virtual.
+
+        For GradientEffect-based effects the override is injected directly into
+        the effect's gradient curve, so all animations continue in the new
+        colours (identical to changing the effect's colour via the UI).
+
+        For other effects the assembled frame is post-processed each cycle
+        using a luminance-preserving tint.
         """
         with self.lock:
             self._color_override = color_or_gradient
-            self._color_override_frame, self._color_override_lut = self._build_override_frame()
+            self._apply_color_override_to_effect()
 
     def clear_color_override(self):
-        """Remove the color override; the running effect is immediately visible again."""
+        """Remove the colour override; the running effect is immediately visible again."""
+        from ledfx.effects.gradient import GradientEffect
+
         with self.lock:
             self._color_override = None
             self._color_override_frame = None
             self._color_override_lut = None
+            if isinstance(self._active_effect, GradientEffect):
+                self._active_effect.clear_gradient_override()
 
     def _fire_update_event(self, frame=None):
         if frame is None:

@@ -71,6 +71,7 @@ def _apply_gradient_override(
     return lut[indices] * maxc[:, np.newaxis]
 
 
+class Virtual:
     CONFIG_SCHEMA = vol.Schema(
         {
             vol.Required(

@@ -8,6 +8,7 @@ from typing import Optional
 import numpy as np
 import voluptuous as vol
 
+from ledfx.color import RGB, parse_gradient
 from ledfx.config import save_config
 from ledfx.effects import DummyEffect
 from ledfx.effects.math import CalibratorPatternCache, interpolate_pixels
@@ -22,6 +23,7 @@ from ledfx.events import (
     EffectSetEvent,
     Event,
     GlobalPauseEvent,
+    VirtualColorOverrideEvent,
     VirtualConfigUpdateEvent,
     VirtualPauseEvent,
     VirtualUpdateEvent,
@@ -30,6 +32,46 @@ from ledfx.transitions import Transitions
 from ledfx.utils import Teleplot, fps_to_sleep_interval, is_gap_device
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _apply_gradient_override(
+    frame: np.ndarray, lut: np.ndarray, lut_size: int
+) -> np.ndarray:
+    """Recolour *frame* using a gradient LUT indexed by per-pixel hue.
+
+    The effect's per-pixel brightness (HSV value = max RGB channel) is
+    preserved so beats, scrolls, and animations continue to show motion.
+    The hue of each pixel is used to select which gradient colour to use,
+    so a scrolling rainbow remaps cleanly to the override gradient palette.
+
+    Args:
+        frame: N x 3 float array (0-255), the assembled effect output.
+        lut: L x 3 float array (0-255), pre-sampled gradient at L positions.
+        lut_size: number of LUT entries (L).
+
+    Returns:
+        N x 3 float array with gradient colours scaled by the effect's
+        brightness.
+    """
+    f = frame / 255.0  # (N, 3) in [0, 1]
+    r, g, b = f[:, 0], f[:, 1], f[:, 2]
+    maxc = np.maximum(np.maximum(r, g), b)  # HSV value (brightness)
+    minc = np.minimum(np.minimum(r, g), b)
+    diff = maxc - minc
+
+    hue = np.zeros(len(frame), dtype=float)
+    chromatic = diff > 1e-6
+    mr = chromatic & (r == maxc)
+    mg = chromatic & (g == maxc) & ~mr
+    mb = chromatic & (b == maxc) & ~mr & ~mg
+    hue[mr] = ((g[mr] - b[mr]) / diff[mr]) % 6
+    hue[mg] = (b[mg] - r[mg]) / diff[mg] + 2
+    hue[mb] = (r[mb] - g[mb]) / diff[mb] + 4
+    hue /= 6.0  # normalise to [0, 1]
+
+    indices = np.clip((hue * (lut_size - 1)).astype(int), 0, lut_size - 1)
+    # Scale gradient colour by the effect's per-pixel brightness
+    return lut[indices] * maxc[:, np.newaxis]
 
 
 class Virtual:
@@ -209,6 +251,14 @@ class Virtual:
         # Maps virtual indices to device indices per device
         self._device_remap: dict = {}
 
+        # Colour override: a transient recolour layer applied on top of the
+        # running effect. The effect keeps rendering and its config is never
+        # touched, so clearing the override restores the show instantly.
+        self._color_override: Optional[str] = None
+        self._color_override_frame: Optional[np.ndarray] = None
+        # For gradient overrides: LUT sampled by per-pixel hue at render time.
+        self._color_override_lut: Optional[np.ndarray] = None
+
         self._debug_flush_total = 0.0
         self._debug_last_report = time.perf_counter()
         self._debug_flush_frames = 0
@@ -346,6 +396,10 @@ class Virtual:
             self._active_effect._deactivate()
             if self.pixel_count > 0:
                 self._active_effect.activate(self)
+                # The pixel count may have changed and the effect lost its
+                # injected gradient, so rebuild the override for the new size.
+                if self._color_override is not None:
+                    self._apply_color_override_to_effect()
 
     def update_segments(self, segments_config):
         """
@@ -660,6 +714,10 @@ class Virtual:
                 )
                 return
             self._active_effect.activate(self)
+            # Re-apply any active colour override to the new effect, so the
+            # override survives an effect change instead of being lost.
+            if self._color_override is not None:
+                self._apply_color_override_to_effect()
             self._ledfx.events.fire_event(
                 EffectSetEvent(
                     self._active_effect.name,
@@ -787,6 +845,141 @@ class Virtual:
         self.flush(self.assembled_frame)
         self._fire_update_event()
 
+    _GRADIENT_LUT_SIZE = 1024
+
+    def _build_override_frame(self):
+        """Build override render data from the stored colour/gradient string.
+
+        Sizing follows :attr:`effective_pixel_count`, not :attr:`pixel_count`,
+        because the assembled frame this data is combined with is produced by
+        the effect and is therefore effect-sized (they differ whenever pixel
+        grouping is active).
+
+        Returns:
+            tuple: ``(spatial_frame, gradient_lut)`` where ``spatial_frame`` is
+            an N x 3 float array of the override colour per pixel, and
+            ``gradient_lut`` is a ``_GRADIENT_LUT_SIZE`` x 3 float array
+            sampled uniformly 0->1, or ``None`` for a solid colour. Both are
+            ``None`` when no override is set or the virtual has no pixels.
+        """
+        n = self.effective_pixel_count
+        if self._color_override is None or n == 0:
+            return None, None
+
+        try:
+            parsed = parse_gradient(self._color_override)
+        except Exception:
+            _LOGGER.warning(
+                "Virtual %s: invalid color override '%s', using white",
+                self.id,
+                self._color_override,
+            )
+            parsed = RGB(255, 255, 255)
+
+        if isinstance(parsed, RGB):
+            spatial = np.tile(
+                [parsed.red, parsed.green, parsed.blue], (n, 1)
+            ).astype(float)
+            return spatial, None  # solid colour: no LUT needed
+
+        # Gradient: build spatial frame (static preview) + hue lookup table
+        def _sample_hex(gradient, pos):
+            hex_c = gradient.sample(pos)
+            return (
+                int(hex_c[1:3], 16),
+                int(hex_c[3:5], 16),
+                int(hex_c[5:7], 16),
+            )
+
+        spatial = np.empty((n, 3), dtype=float)
+        for i in range(n):
+            r, g, b = _sample_hex(parsed, i / max(n - 1, 1))
+            spatial[i] = [r, g, b]
+
+        lut_size = self._GRADIENT_LUT_SIZE
+        lut = np.empty((lut_size, 3), dtype=float)
+        for i in range(lut_size):
+            r, g, b = _sample_hex(parsed, i / (lut_size - 1))
+            lut[i] = [r, g, b]
+
+        return spatial, lut
+
+    def _apply_color_override_to_effect(self):
+        """Route the override to the effect, or to frame post-processing.
+
+        Must be called with ``self.lock`` held. Runs whenever the override is
+        activated, the effect changes, or the pixel count changes while an
+        override is active.
+        """
+        from ledfx.effects.gradient import GradientEffect
+
+        if self._color_override is None:
+            return
+
+        if isinstance(self._active_effect, GradientEffect):
+            # The effect handles colour natively - inject the override gradient
+            # so animations (roll, modulation, etc.) continue unaffected.
+            self._active_effect.set_gradient_override(self._color_override)
+            # No post-processing needed
+            self._color_override_frame = None
+            self._color_override_lut = None
+        else:
+            # Fallback: post-process the assembled frame for effects that do
+            # not expose a gradient config (e.g. Energy, solid-colour effects).
+            (
+                self._color_override_frame,
+                self._color_override_lut,
+            ) = self._build_override_frame()
+
+    def set_color_override(self, color_or_gradient: str):
+        """Activate a transient colour override on this virtual.
+
+        For :class:`~ledfx.effects.gradient.GradientEffect` effects the override
+        is injected into the effect's gradient curve, so every animation keeps
+        running in the new colours - the same result as changing the effect's
+        colour in the UI, but without writing to the effect's config.
+
+        For other effects the assembled frame is recoloured each cycle,
+        preserving the effect's per-pixel brightness so beats and pulses
+        still read.
+
+        Nothing is persisted: :meth:`clear_color_override` restores the
+        original show exactly.
+
+        Args:
+            color_or_gradient: a colour or gradient string, e.g. ``"#ff0000"``,
+                ``"red"``, or ``"linear-gradient(...)"``.
+        """
+        with self.lock:
+            self._color_override = color_or_gradient
+            self._apply_color_override_to_effect()
+        self._ledfx.events.fire_event(
+            VirtualColorOverrideEvent(self.id, color_or_gradient)
+        )
+
+    def clear_color_override(self):
+        """Remove the colour override, revealing the running effect again.
+
+        Safe to call when no override is active, in which case no event is
+        fired.
+        """
+        from ledfx.effects.gradient import GradientEffect
+
+        with self.lock:
+            if self._color_override is None:
+                return
+            self._color_override = None
+            self._color_override_frame = None
+            self._color_override_lut = None
+            if isinstance(self._active_effect, GradientEffect):
+                self._active_effect.clear_gradient_override()
+        self._ledfx.events.fire_event(VirtualColorOverrideEvent(self.id, None))
+
+    @property
+    def color_override(self) -> Optional[str]:
+        """The active colour/gradient override string, or ``None``."""
+        return self._color_override
+
     def _fire_update_event(self, frame=None):
         if frame is None:
             frame = self.assembled_frame
@@ -852,6 +1045,29 @@ class Virtual:
                     # )
                     self.assembled_frame = self.assemble_frame()
                     if self.assembled_frame is not None and not self._paused:
+                        # Recolour the frame, keeping the effect's animation.
+                        # Only reached for non-gradient effects; gradient
+                        # effects are recoloured at their own source.
+                        if self._color_override_lut is not None:
+                            # Gradient override: per-pixel hue picks the
+                            # gradient colour, per-pixel brightness is kept.
+                            self.assembled_frame = _apply_gradient_override(
+                                self.assembled_frame,
+                                self._color_override_lut,
+                                self._GRADIENT_LUT_SIZE,
+                            )
+                        elif self._color_override_frame is not None:
+                            # Solid colour override: tint by per-pixel
+                            # luminance so beats and pulses still show.
+                            luminance = (
+                                np.max(
+                                    self.assembled_frame, axis=1, keepdims=True
+                                )
+                                / 255.0
+                            )
+                            self.assembled_frame = (
+                                self._color_override_frame * luminance
+                            )
                         if not self._config["preview_only"]:
                             # self._ledfx.thread_executor.submit(self.flush)
                             # await self._ledfx.loop.run_in_executor(

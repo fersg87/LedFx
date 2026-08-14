@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -29,6 +29,7 @@ class Event:
     VIRTUAL_CONFIG_UPDATE = "virtual_config_update"
     GLOBAL_PAUSE = "global_pause"
     VIRTUAL_PAUSE = "virtual_pause"
+    VIRTUAL_COLOR_OVERRIDE = "virtual_color_override"
     AUDIO_INPUT_DEVICE_CHANGED = "audio_input_device_changed"
     AUDIO_DEVICE_LIST_CHANGED = "audio_device_list_changed"
     VIRTUAL_DIAG = "virtual_diag"
@@ -268,6 +269,21 @@ class VirtualPauseEvent(Event):
         super().__init__(Event.VIRTUAL_PAUSE)
         self.virtual_id = virtual_id
         self.paused = paused
+
+
+class VirtualColorOverrideEvent(Event):
+    """Event emitted when a virtual's colour override is set or cleared.
+
+    Attributes:
+        virtual_id: the virtual whose override changed.
+        color_override: the active colour/gradient string, or ``None`` when the
+            override was cleared and the effect's own colours are showing again.
+    """
+
+    def __init__(self, virtual_id: str, color_override: Optional[str]):
+        super().__init__(Event.VIRTUAL_COLOR_OVERRIDE)
+        self.virtual_id = virtual_id
+        self.color_override = color_override
 
 
 class AudioDeviceChangeEvent(Event):

@@ -23,6 +23,9 @@ class EffectsEndpoint(RestEndpoint):
         """
         Retrieves the active effects for each virtual LED strip.
 
+        Each entry also reports ``color_override``: the transient colour or
+        gradient currently recolouring that effect, or ``None``.
+
         Returns:
             web.Response: The HTTP response containing the active effects for each virtual LED strip.
         """
@@ -32,6 +35,7 @@ class EffectsEndpoint(RestEndpoint):
                 response["effects"][virtual.id] = {
                     "effect_type": virtual.active_effect.type,
                     "effect_config": virtual.active_effect.config,
+                    "color_override": virtual.color_override,
                 }
         return await self.bare_request_success(response)
 
@@ -60,6 +64,8 @@ class EffectsEndpoint(RestEndpoint):
             "clear_all_effects",
             "apply_global",
             "apply_global_effect",
+            "apply_override",
+            "clear_override",
         ]:
             return await self.invalid_request(f'Invalid action "{action}"')
 
@@ -68,6 +74,12 @@ class EffectsEndpoint(RestEndpoint):
 
         if action == "apply_global_effect":
             return await self._apply_global_effect(data)
+
+        if action == "apply_override":
+            return await self._apply_override(data)
+
+        if action == "clear_override":
+            return await self._clear_override(data)
 
         # Clear all effects on all devices
         if action == "clear_all_effects":
@@ -186,6 +198,113 @@ class EffectsEndpoint(RestEndpoint):
         return await self.request_success(
             "success",
             f"Applied global configuration to {updated} effects (skipped {skipped})",
+        )
+
+    def _resolve_virtuals(self, data: dict):
+        """Resolve the optional ``virtuals`` filter of an override request.
+
+        Args:
+            data (dict): the request payload.
+
+        Returns:
+            tuple: ``(virtuals, error)``. ``virtuals`` is the list of
+            :class:`~ledfx.virtuals.Virtual` to act on - every virtual when no
+            filter was supplied - and ``error`` is a message string when the
+            filter was malformed, otherwise ``None``.
+        """
+        if "virtuals" not in data:
+            return list(self._ledfx.virtuals.values()), None
+
+        vlist = data["virtuals"]
+        if not isinstance(vlist, list):
+            return (
+                None,
+                'Invalid value for "virtuals": must be a list of virtual ids',
+            )
+
+        target_ids = {str(v) for v in vlist}
+        return [
+            virtual
+            for virtual in self._ledfx.virtuals.values()
+            if virtual.id in target_ids
+        ], None
+
+    async def _apply_override(self, data: dict) -> web.Response:
+        """Apply a transient colour override to the targeted virtuals.
+
+        Unlike ``apply_global``, this does not touch effect config and is not
+        persisted: the running effect keeps animating underneath and
+        ``clear_override`` restores it exactly. Effects without a ``gradient``
+        config key are recoloured too, which ``apply_global`` cannot do.
+
+        Expected payload::
+
+            {
+                "action": "apply_override",
+                "color": "#ff0000",          # or "gradient": "linear-gradient(...)"
+                "virtuals": ["id1", "id2"]   # optional, defaults to all
+            }
+
+        Args:
+            data (dict): the request payload.
+
+        Returns:
+            web.Response: the HTTP response object.
+        """
+        if ("color" in data) == ("gradient" in data):
+            return await self.invalid_request(
+                'Exactly one of "color" or "gradient" must be provided'
+            )
+
+        try:
+            if "color" in data:
+                override = validate_color(data["color"])
+            else:
+                override = validate_gradient(data["gradient"])
+        except Exception as e:
+            return await self.invalid_request(f"Invalid override color: {e}")
+
+        virtuals, error = self._resolve_virtuals(data)
+        if error is not None:
+            return await self.invalid_request(error)
+
+        for virtual in virtuals:
+            virtual.set_color_override(override)
+
+        return await self.request_success(
+            "success",
+            f"Applied color override to {len(virtuals)} virtuals",
+        )
+
+    async def _clear_override(self, data: dict) -> web.Response:
+        """Clear the colour override on the targeted virtuals.
+
+        Expected payload::
+
+            {
+                "action": "clear_override",
+                "virtuals": ["id1", "id2"]   # optional, defaults to all
+            }
+
+        Args:
+            data (dict): the request payload.
+
+        Returns:
+            web.Response: the HTTP response object.
+        """
+        virtuals, error = self._resolve_virtuals(data)
+        if error is not None:
+            return await self.invalid_request(error)
+
+        cleared = 0
+        for virtual in virtuals:
+            if virtual.color_override is not None:
+                virtual.clear_color_override()
+                cleared += 1
+
+        return await self.request_success(
+            "success",
+            f"Cleared color override on {cleared} virtuals",
         )
 
     async def _apply_global_effect(self, data: dict) -> web.Response:

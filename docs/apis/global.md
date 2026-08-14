@@ -219,3 +219,115 @@ curl -X PUT http://localhost:8888/api/effects \
 
 *Note: Returns HTTP 200 status code by default for frontend snackbar compatibility.*
 
+
+---
+
+## apply_override / clear_override
+
+A pair of bulk actions that recolour the **currently running** effects on a set of
+virtuals, without changing their configuration.
+
+This is the non-destructive counterpart to [`apply_global`](#apply_global). Use
+`apply_global` to *change the show*; use `apply_override` to *temporarily gel the
+show* and `clear_override` to put it straight back.
+
+| | `apply_global` | `apply_override` |
+|---|---|---|
+| Writes to the effect's config | yes | no |
+| Saved to `config.json` | yes | no |
+| Reversible | no — the original colour is gone | yes — `clear_override` restores it exactly |
+| Effects with no `gradient` config key | skipped | recoloured via the render pipeline |
+| Survives an effect change on the virtual | no | yes — the override is re-applied |
+
+### Behavior
+
+- **Targets:** every virtual in `virtuals`, or all virtuals when the field is omitted.
+- **Gradient-based effects** have the override injected into their gradient curve, so
+  gradient roll, modulation and beat response keep animating in the new colours.
+- **All other effects** have their assembled frame recoloured each cycle. Per-pixel
+  brightness is preserved, so beats and pulses still read; for a gradient override the
+  per-pixel hue selects the position along the gradient.
+- **Not persisted:** no config is written and nothing is saved to disk. An override does
+  not survive a LedFx restart.
+- **Sticky across effect changes:** setting a new effect on a virtual that has an active
+  override re-applies the override to the new effect.
+- **Idempotent:** re-applying the same override is a no-op; clearing a virtual that has no
+  override is also a no-op and is not counted.
+- **Events:** a `virtual_color_override` websocket event is fired whenever a virtual's
+  override is set or cleared, carrying `virtual_id` and `color_override` (`null` when
+  cleared). `GET /api/effects` also reports `color_override` per virtual.
+
+---
+
+### Endpoint
+
+**PUT** `/api/effects` with `action: "apply_override"` or `action: "clear_override"`
+
+### Request body — `apply_override`
+
+| Field      | Type             | Required | Description |
+|------------|------------------|----------|-------------|
+| `action`   | string           | yes      | Must be `"apply_override"`. |
+| `color`    | string           | see note | A solid colour (e.g. `"red"`, `"#ff0000"`, `"rgb(255,0,0)"`). |
+| `gradient` | string           | see note | A gradient definition (e.g. `"linear-gradient(90deg, rgb(255,0,0) 0%, rgb(0,0,255) 100%)"`). |
+| `virtuals` | array[string]    | no       | Virtual ids to target. When omitted, targets all virtuals. |
+
+**Note:** exactly one of `color` or `gradient` must be provided. Supplying both, or
+neither, is a 400.
+
+### Request body — `clear_override`
+
+| Field      | Type             | Required | Description |
+|------------|------------------|----------|-------------|
+| `action`   | string           | yes      | Must be `"clear_override"`. |
+| `virtuals` | array[string]    | no       | Virtual ids to target. When omitted, targets all virtuals. |
+
+### Examples
+
+#### Gel two virtuals red, leaving their effects running
+
+```bash
+curl -X PUT http://localhost:8888/api/effects \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "apply_override",
+    "color": "#ff0000",
+    "virtuals": ["front-bar", "back-wall"]
+  }'
+```
+
+#### Push a gradient override across every virtual
+
+```bash
+curl -X PUT http://localhost:8888/api/effects \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "apply_override",
+    "gradient": "linear-gradient(90deg, rgb(255,0,0) 0%, rgb(0,0,255) 100%)"
+  }'
+```
+
+#### Drop back to the running show
+
+```bash
+curl -X PUT http://localhost:8888/api/effects \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "clear_override",
+    "virtuals": ["front-bar", "back-wall"]
+  }'
+```
+
+### Response
+
+```json
+{
+  "status": "success",
+  "payload": {
+    "type": "success",
+    "reason": "Applied color override to 2 virtuals"
+  }
+}
+```
+
+*Note: Returns HTTP 200 status code by default for frontend snackbar compatibility.*

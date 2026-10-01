@@ -314,3 +314,45 @@ def test_invalid_override_falls_back_to_white_for_gradient_effects() -> None:
     with patch.object(Virtual, "id", "v"):
         virtual._apply_color_override_to_effect()
     virtual._active_effect.set_gradient_override.assert_called_once_with("#ffffff")
+
+
+def test_set_paused_clears_override_and_persists(
+    mgr: VenueManager, ledfx: MagicMock
+) -> None:
+    venue_id, _ = mgr.create(name="J", rows=1, cols=1)
+    v1 = _add_virtual(ledfx, "v1")
+    mgr.add_virtual(venue_id, "v1")
+    mgr.activate_override(venue_id, 0)
+
+    updated = mgr.set_paused(venue_id, True)
+    assert updated.paused is True
+    v1.clear_color_override.assert_called_once()
+    assert mgr.is_paused(venue_id) is True
+
+
+def test_set_paused_false_does_not_clear_override(
+    mgr: VenueManager, ledfx: MagicMock
+) -> None:
+    venue_id, _ = mgr.create(name="K", rows=1, cols=1)
+    v1 = _add_virtual(ledfx, "v1")
+    mgr.add_virtual(venue_id, "v1")
+    mgr.activate_override(venue_id, 0)
+    v1.clear_color_override.reset_mock()
+
+    updated = mgr.set_paused(venue_id, False)
+    assert updated.paused is False
+    v1.clear_color_override.assert_not_called()
+    assert mgr.is_paused(venue_id) is False
+
+
+def test_set_paused_missing_venue_raises(mgr: VenueManager) -> None:
+    with pytest.raises(KeyError):
+        mgr.set_paused("nope", True)
+
+
+def test_is_paused_defaults_false_for_new_venue_and_missing_venue(
+    mgr: VenueManager,
+) -> None:
+    venue_id, _ = mgr.create(name="L")
+    assert mgr.is_paused(venue_id) is False
+    assert mgr.is_paused("nope") is False
